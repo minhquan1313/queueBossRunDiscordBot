@@ -8,7 +8,8 @@ import re
 try:
     from dotenv import load_dotenv  # type: ignore
 
-    load_dotenv()
+    # Ensure local .env can override any inherited machine env for convenience
+    load_dotenv(override=True)
 except Exception:
     # If python-dotenv isn't installed, continue; BOT_TOKEN may still come from OS env or token file
     pass
@@ -481,6 +482,7 @@ async def on_ready():
 
 if __name__ == "__main__":
     # Prefer BOT_TOKEN from environment (via .env). If missing, try fallbacks.
+    token_source = "env" if BOT_TOKEN else None
     if not BOT_TOKEN:
         # Fallback 1: parse .env manually in case python-dotenv isn't installed
         try:
@@ -492,9 +494,28 @@ if __name__ == "__main__":
                             continue
                         if line.startswith("BOT_TOKEN="):
                             BOT_TOKEN = line.split("=", 1)[1].strip()
+                            token_source = token_source or ".env"
                             break
         except Exception:
             pass
+    else:
+        # If token is present in env but looks like a placeholder, try .env to override
+        looks_placeholder = (BOT_TOKEN.count(".") < 2) or BOT_TOKEN.upper().startswith("YOUR")
+        if looks_placeholder and os.path.exists(".env"):
+            try:
+                with open(".env", "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s or s.startswith("#"):
+                            continue
+                        if s.startswith("BOT_TOKEN="):
+                            candidate = s.split("=", 1)[1].strip()
+                            if candidate and candidate.count(".") >= 2:
+                                BOT_TOKEN = candidate
+                                token_source = ".env_override"
+                            break
+            except Exception:
+                pass
 
     if not BOT_TOKEN:
         # Fallback 2: legacy token file, only if it exists
@@ -502,6 +523,7 @@ if __name__ == "__main__":
             if os.path.exists("token"):
                 with open("token", "r", encoding="utf-8") as f:
                     BOT_TOKEN = f.read().strip()
+                    token_source = token_source or "token_file"
         except Exception:
             pass
 
@@ -509,4 +531,30 @@ if __name__ == "__main__":
         # Final: no token anywhere
         raise SystemExit(STRINGS[DEFAULT_LANG].get("token_missing", "Missing BOT_TOKEN"))
 
-    bot.run(BOT_TOKEN)
+    # Normalize token in case users paste with quotes or prefix
+    BOT_TOKEN = BOT_TOKEN.strip()
+    if (BOT_TOKEN.startswith('"') and BOT_TOKEN.endswith('"')) or (
+        BOT_TOKEN.startswith("'") and BOT_TOKEN.endswith("'")
+    ):
+        BOT_TOKEN = BOT_TOKEN[1:-1]
+    if BOT_TOKEN.lower().startswith("bot "):
+        BOT_TOKEN = BOT_TOKEN[4:].strip()
+
+    # Debug: show where token was loaded and a masked preview
+    parts = BOT_TOKEN.split('.')
+    if os.getenv("DEBUG_SHOW_TOKEN") == "1":
+        preview = BOT_TOKEN
+    else:
+        preview = BOT_TOKEN if len(BOT_TOKEN) <= 10 else (BOT_TOKEN[:4] + "..." + BOT_TOKEN[-4:])
+    print(f"[DEBUG] BOT_TOKEN source={token_source or 'unknown'}, length={len(BOT_TOKEN)}, dots={len(parts)-1}, preview={preview}")
+
+    # Quick sanity hint if token doesn't look like a bot token
+    if BOT_TOKEN.count(".") < 2:
+        print("[WARN] BOT_TOKEN format looks unusual. Ensure it's the Bot Token from Developer Portal > Bot tab, not Client Secret or OAuth token.")
+
+    try:
+        bot.run(BOT_TOKEN)
+    except discord.LoginFailure:
+        raise SystemExit(
+            "Login failed: invalid BOT_TOKEN. Regenerate the Bot Token (Developer Portal > Bot > Reset Token) and update your .env."
+        )
