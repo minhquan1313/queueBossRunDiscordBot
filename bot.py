@@ -416,6 +416,44 @@ async def queue_reset(interaction: discord.Interaction, key: str):
     )
 
 
+@bot.tree.command(name="queue_list_n", description="Show the first N users in a queue.")
+@admin_only()
+@app_commands.describe(
+    key="Queue key (e.g., boss-a)",
+    count="How many users to show (default 8)",
+)
+async def queue_list_n(interaction: discord.Interaction, key: str, count: int = 8):
+    await ensure_store_ready(interaction)
+    lang = bot.store.get_lang()
+    users = bot.store.get_list(key)
+    if not users:
+        await interaction.response.send_message(
+            t(lang, "list_empty", key=key), ephemeral=True
+        )
+        return
+
+    # clamp count
+    count = max(1, min(int(count), 50))
+    head = users[:count]
+    lines = []
+    for i, uid in enumerate(head, start=1):
+        member = interaction.guild.get_member(uid)
+        name = member.display_name if member else f"<@{uid}>"
+        lines.append(f"**#{i}** {name} (<@{uid}>)")
+    text = "\n".join(lines)
+    await interaction.response.send_message(
+        t(
+            lang,
+            "head_header",
+            key=key,
+            shown=len(head),
+            total=len(users),
+            lines=text,
+        ),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(
     name="queue_sync", description="(admin) Sync slash commands for this server."
 )
@@ -428,7 +466,7 @@ async def queue_sync(interaction: discord.Interaction):
 
 # ---- LANGUAGE COMMAND ----
 @bot.tree.command(
-    name="language", description="Set or show bot language for this server."
+    name="queue_language", description="Set or show bot language for this server."
 )
 @admin_only()
 @app_commands.describe(lang="Choose language")
@@ -481,6 +519,16 @@ async def on_ready():
 
 
 if __name__ == "__main__":
+    # Start keep-alive web server (used by Replit free). Disable with KEEP_ALIVE=0
+    if os.getenv("KEEP_ALIVE", "1") != "0":
+        try:
+            from keep_alive import keep_alive
+
+            keep_alive()
+            print("[INFO] keep_alive web server started (/: 200)")
+        except Exception as e:
+            print(f"[WARN] keep_alive not started: {e}")
+
     # Prefer BOT_TOKEN from environment (via .env). If missing, try fallbacks.
     token_source = "env" if BOT_TOKEN else None
     if not BOT_TOKEN:

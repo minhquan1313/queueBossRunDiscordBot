@@ -10,6 +10,7 @@
   "setup_ok": "Storage channel #queue-storage is ready.",
   "list_empty": "`{key}` has no signups.",
   "list_header": "Queue `{key}` ({count} users):\n{lines}",
+  "head_header": "First {shown}/{total} users in `{key}`:\n{lines}",
   "kick_ok": "Removed {user} from `{key}`.",
   "kick_none": "That user is not in `{key}`.",
   "reset_ok": "Reset queue `{key}`.",

@@ -10,6 +10,7 @@
   "setup_ok": "Kênh lưu trữ #queue-storage đã sẵn sàng.",
   "list_empty": "`{key}` chưa có ai đăng ký.",
   "list_header": "Danh sách `{key}` ({count} người):\n{lines}",
+  "head_header": "{shown}/{total} người đầu trong `{key}`:\n{lines}",
   "kick_ok": "Đã xóa {user} khỏi `{key}`.",
   "kick_none": "Người dùng này không có trong `{key}`.",
   "reset_ok": "Đã reset danh sách `{key}`.",
