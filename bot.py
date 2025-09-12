@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from typing import Dict, List, Optional
+import re
 
 # Load environment variables from a local .env file if present
 try:
@@ -204,7 +205,8 @@ class QueueStore:
 
 # ====== UI VIEW ======
 class SignupView(discord.ui.View):
-    def __init__(self, key: str, store: QueueStore, *, timeout: Optional[float] = None):
+    def __init__(self, key: Optional[str], store: QueueStore, *, timeout: Optional[float] = None):
+        # timeout=None enables persistent views
         super().__init__(timeout=timeout)
         self.key = key
         self.store = store
@@ -214,23 +216,44 @@ class SignupView(discord.ui.View):
         self.signup.label = t(lang, "btn_signup")
         self.cancel.label = t(lang, "btn_cancel")
 
+    def _extract_key(self, message: discord.Message) -> Optional[str]:
+        # Prefer explicit key
+        if self.key:
+            return self.key
+        embeds = list(message.embeds)
+        if not embeds:
+            return None
+        desc = embeds[0].description or ""
+        # find first backtick section — panel_desc includes `{key}`
+        m = re.search(r"`([^`]+)`", desc)
+        if m:
+            return m.group(1)
+        # fallback: try title like "Signup: {key}"
+        title = embeds[0].title or ""
+        if ":" in title:
+            return title.split(":", 1)[1].strip()
+        return None
+
     async def _update_panel(self, interaction: discord.Interaction):
         lang = self.store.get_lang()
         msg = interaction.message
+        key = self._extract_key(msg)
+        if not key:
+            return
 
         embeds = list(msg.embeds)
         if not embeds:
             emb = discord.Embed(
-                title=t(lang, "panel_title", key=self.key),
-                description=t(lang, "panel_desc", key=self.key),
+                title=t(lang, "panel_title", key=key),
+                description=t(lang, "panel_desc", key=key),
             )
             embeds = [emb]
 
         emb = embeds[0]
         if not emb.title:
-            emb.title = t(lang, "panel_title", key=self.key)
-        emb.description = t(lang, "panel_desc", key=self.key)
-        emb.set_footer(text=t(lang, "footer_count", count=self.store.count(self.key)))
+            emb.title = t(lang, "panel_title", key=key)
+        emb.description = t(lang, "panel_desc", key=key)
+        emb.set_footer(text=t(lang, "footer_count", count=self.store.count(key)))
 
         try:
             await msg.edit(embeds=embeds, view=self)
@@ -241,7 +264,11 @@ class SignupView(discord.ui.View):
     @discord.ui.button(style=discord.ButtonStyle.primary, custom_id="btn_signup")
     async def signup(self, interaction: discord.Interaction, button: discord.ui.Button):
         lang = self.store.get_lang()
-        pos = await self.store.add(self.key, interaction.user.id)
+        key = self._extract_key(interaction.message)
+        if not key:
+            await interaction.response.send_message("Missing key", ephemeral=True)
+            return
+        pos = await self.store.add(key, interaction.user.id)
         await self._update_panel(interaction)
         await interaction.response.send_message(
             t(
@@ -249,7 +276,7 @@ class SignupView(discord.ui.View):
                 "signed_pos",
                 name=interaction.user.display_name,
                 pos=pos,
-                key=self.key,
+                key=key,
             ),
             ephemeral=True,
         )
@@ -257,7 +284,11 @@ class SignupView(discord.ui.View):
     @discord.ui.button(style=discord.ButtonStyle.secondary, custom_id="btn_cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         lang = self.store.get_lang()
-        removed = await self.store.remove(self.key, interaction.user.id)
+        key = self._extract_key(interaction.message)
+        if not key:
+            await interaction.response.send_message("Missing key", ephemeral=True)
+            return
+        removed = await self.store.remove(key, interaction.user.id)
         await self._update_panel(interaction)
         if removed:
             await interaction.response.send_message(
@@ -278,6 +309,9 @@ class QueueBot(commands.Bot):
     async def setup_hook(self):
         # Global sync (may take a few seconds). Use /queue_sync for instant guild sync.
         await self.tree.sync()
+        # Re-register a persistent view so old panels keep working after restarts
+        # This view infers the key from the message embed when buttons are clicked
+        self.add_view(SignupView(key=None, store=self.store, timeout=None))
 
     async def on_guild_join(self, guild: discord.Guild):
         await self.tree.sync(guild=guild)
@@ -476,4 +510,3 @@ if __name__ == "__main__":
         raise SystemExit(STRINGS[DEFAULT_LANG].get("token_missing", "Missing BOT_TOKEN"))
 
     bot.run(BOT_TOKEN)
-
