@@ -1,4 +1,4 @@
-{
+﻿{
   "panel_title": "Đăng ký: {key}",
   "panel_desc": "Hàng đăng ký cho `{key}`.\nBấm Đăng ký để vào hàng hoặc Hủy để rời.",
   "footer_count": "Đã đăng ký: {count}",
@@ -21,5 +21,10 @@
   "lang_choice_desc": "Chọn ngôn ngữ",
   "lang_name_en": "Tiếng Anh",
   "lang_name_vi": "Tiếng Việt",
-  "token_missing": "Vui lòng đặt biến môi trường BOT_TOKEN hoặc tạo file token."
+  "token_missing": "Vui lòng đặt biến môi trường BOT_TOKEN hoặc tạo file token.",
+  "remove_multi_result": "Đã xóa: {removed} ( {removed_list} ). Không thấy: {missing} ( {missing_list} ) trong `{key}`.",
+  "remove_n_result": "Đã xóa {n} người đầu trong `{key}`: {users}",
+  "notify_result": "Đã gửi DM: {sent}, thất bại: {failed}.\nĐã gửi: {sent_list}\nThất bại: {failed_list}",
+  "notify_dm_boss_run": "{title} hiện đã sẵn sàng cho lần chạy mới, bấm nút để xem giờ và đặt hàng ngay để giữ chỗ."
 }
+

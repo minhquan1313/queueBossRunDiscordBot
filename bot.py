@@ -35,7 +35,8 @@ STRINGS: Dict[str, Dict[str, str]] = {}
 for fn in os.listdir("lang"):
     if fn.endswith(".json"):
         code = fn[:-5]  # "en", "vi"
-        with open(os.path.join("lang", fn), encoding="utf-8") as f:
+        # Use utf-8-sig to handle files saved with BOM on Windows
+        with open(os.path.join("lang", fn), encoding="utf-8-sig") as f:
             STRINGS[code] = json.load(f)
 
 DEFAULT_LANG = "en"
@@ -137,9 +138,9 @@ class QueueStore:
         self._settings["lang"] = lang if lang in STRINGS else DEFAULT_LANG
         payload = json.dumps(self._settings, separators=(",", ":"))
         if self.settings_message:
-            await self.settings_message.edit(
-                content=f"{SETTINGS_MESSAGE_PREFIX}\n{payload}"
-            )
+            await self.settings_message.edit(content=f"{SETTINGS_MESSAGE_PREFIX}\n{payload}")
+
+    # No per-key title stored; titles live on each panel message's embed
 
     # ----- queues -----
     async def ensure_key(self, key: str):
@@ -202,6 +203,57 @@ class QueueStore:
         await self.ensure_key(key)
         self._queues[key] = []
         await self._save_queue(key)
+
+    async def pop_n(self, key: str, n: int) -> List[int]:
+        """Remove and return up to n users from the front of the queue."""
+        await self.ensure_key(key)
+        q = self._queues[key]
+        n = max(0, min(n, len(q)))
+        removed = q[:n]
+        del q[:n]
+        await self._save_queue(key)
+        return removed
+
+
+# ====== PANEL HELPERS ======
+async def update_panel_message(msg: discord.Message, key: str, store: QueueStore):
+    """Update a panel message's embed text/footers for the given key."""
+    lang = store.get_lang()
+    embeds = list(msg.embeds)
+    if not embeds:
+        emb = discord.Embed(
+            title=t(lang, "panel_title", key=key),
+            description=t(lang, "panel_desc", key=key),
+        )
+        embeds = [emb]
+    emb = embeds[0]
+    if not emb.title:
+        emb.title = t(lang, "panel_title", key=key)
+    emb.description = t(lang, "panel_desc", key=key)
+    emb.set_footer(text=t(lang, "footer_count", count=store.count(key)))
+    try:
+        await msg.edit(embeds=embeds)
+    except Exception as e:
+        print("[UPDATE_PANEL_ERROR]", e)
+
+
+async def update_all_panels_for_key(guild: discord.Guild, key: str, store: QueueStore):
+    """Scan channels and update panels that reference the given key."""
+    look_desc = f"`{key}`"
+    look_title = f": {key}"
+    for ch in guild.text_channels:
+        try:
+            async for m in ch.history(limit=200, oldest_first=False):
+                if m.author != guild.me or not m.embeds:
+                    continue
+                emb = m.embeds[0]
+                desc = (emb.description or "")
+                ttl = (emb.title or "")
+                if (look_desc in desc) or (look_title in ttl):
+                    await update_panel_message(m, key, store)
+        except Exception:
+            # missing permissions or access; skip channel
+            continue
 
 
 # ====== UI VIEW ======
@@ -301,6 +353,74 @@ class SignupView(discord.ui.View):
             )
 
 
+# ====== DM RUN VIEW ======
+class DMRunView(discord.ui.View):
+    def __init__(self, store: QueueStore, url: Optional[str] = None, *, timeout: Optional[float] = None):
+        super().__init__(timeout=timeout)
+        self.store = store
+        # We want: Go (left) | Leave (right). Add Go first, then Leave.
+        if url:
+            self.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Go", url=url))
+
+        # Dynamic Leave button so we can control order; keep a stable custom_id for persistence.
+        leave_button = discord.ui.Button(label="Leave", style=discord.ButtonStyle.danger, custom_id="dm_leave")
+
+        async def on_leave(interaction: discord.Interaction):
+            await self.dm_leave(interaction, leave_button)
+
+        leave_button.callback = on_leave  # type: ignore[assignment]
+        self.add_item(leave_button)
+
+    async def dm_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Acknowledge immediately to avoid Unknown interaction (10062)
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+        # Extract key and guild id from message
+        msg = interaction.message
+        emb = msg.embeds[0] if msg.embeds else None
+        desc = (emb.description if emb else msg.content) or ""
+        footer = emb.footer.text if emb and emb.footer else ""
+
+        # key is inside backticks in description; gid is in footer as gid:<id>
+        key = None
+        gid = None
+        m = re.search(r"`([^`]+)`", desc) or re.search(r"key:([^\s]+)", footer)
+        if m:
+            key = m.group(1)
+        mg = re.search(r"gid:(\d+)", footer or desc)
+        if mg:
+            gid = int(mg.group(1))
+
+        if not key or not gid:
+            await interaction.followup.send("Context missing.")
+            return
+
+        guild = interaction.client.get_guild(gid)
+        if not guild:
+            await interaction.followup.send("Guild not found.")
+            return
+        try:
+            await self.store.init_storage(guild)
+        except Exception:
+            pass
+        # Remove user from queue
+        await self.store.remove(key, interaction.user.id)
+        lang = self.store.get_lang()
+        # Prefer the DM embed title (queue title) over fallback "Signup: {key}"
+        title = (emb.title if emb and emb.title else None) or t(lang, "panel_title", key=key)
+        await interaction.followup.send(
+            f"Now you are no longer get any DM from the {title}, but you can always signup again."
+        )
+
+        # Refresh panels after responding
+        try:
+            await update_all_panels_for_key(guild, key, self.store)
+        except Exception:
+            pass
+
 # ====== BOT ======
 class QueueBot(commands.Bot):
     def __init__(self):
@@ -313,6 +433,15 @@ class QueueBot(commands.Bot):
         # Re-register a persistent view so old panels keep working after restarts
         # This view infers the key from the message embed when buttons are clicked
         self.add_view(SignupView(key=None, store=self.store, timeout=None))
+        # Persistent DM view for DM leave buttons
+        self.add_view(DMRunView(store=self.store, timeout=None))
+        # Start heartbeat logger/pinger (optional)
+        if os.getenv("HEARTBEAT", "1") != "0":
+            try:
+                asyncio.create_task(heartbeat_task())
+                print("[INFO] Heartbeat task started")
+            except Exception as e:
+                print(f"[WARN] Heartbeat not started: {e}")
 
     async def on_guild_join(self, guild: discord.Guild):
         await self.tree.sync(guild=guild)
@@ -334,6 +463,38 @@ def admin_only():
 
 async def ensure_store_ready(interaction: discord.Interaction):
     await bot.store.init_storage(interaction.guild)
+
+
+# ====== HEARTBEAT / SUPERVISOR ======
+async def heartbeat_task():
+    try:
+        interval = int(os.getenv("HEARTBEAT_INTERVAL", "300"))
+    except Exception:
+        interval = 300
+    port = os.getenv("PORT", "8080")
+    url = os.getenv("HEARTBEAT_URL") or f"http://127.0.0.1:{port}/healthz"
+    print(f"[HEARTBEAT] Using interval={interval}s url={url}")
+    import urllib.request
+
+    while True:
+        # Log before sleeping, so you always see when next ping will happen
+        print(f"[HEARTBEAT] Next ping in {interval}s -> {url}")
+        try:
+            await asyncio.sleep(interval)
+        except Exception:
+            # loop shutdown
+            return
+        print(f"[HEARTBEAT] Pinging {url} ...")
+        try:
+            # Synchronous HTTP in thread to avoid extra deps
+            def _ping(u: str):
+                with urllib.request.urlopen(u, timeout=10) as resp:
+                    return resp.status
+
+            status = await asyncio.to_thread(_ping, url)
+            print(f"[HEARTBEAT] Pong {status}")
+        except Exception as e:
+            print(f"[HEARTBEAT_WARN] Ping failed: {e}")
 
 
 # ====== COMMANDS ======
@@ -364,6 +525,39 @@ async def queue_create(interaction: discord.Interaction, key: str, title: str):
     await interaction.response.send_message(embed=emb, view=view)
 
 
+@bot.tree.command(name="queue_set_title", description="Edit the title on existing panels for a queue key.")
+@admin_only()
+@app_commands.describe(key="Queue key", title="New panel title")
+async def queue_set_title(interaction: discord.Interaction, key: str, title: str):
+    await ensure_store_ready(interaction)
+    # Acknowledge early to avoid interaction timeout while scanning/updating
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    # Update all panel messages' embed title that reference this key
+    lang = bot.store.get_lang()
+    updated = 0
+    look_desc = f"`{key}`"
+    look_title = f": {key}"
+    for ch in interaction.guild.text_channels:
+        try:
+            async for m in ch.history(limit=200, oldest_first=False):
+                if m.author != interaction.guild.me or not m.embeds:
+                    continue
+                emb = m.embeds[0]
+                desc = (emb.description or "")
+                ttl = (emb.title or "")
+                if (look_desc in desc) or (look_title in ttl):
+                    new_emb = discord.Embed(title=title, description=t(lang, "panel_desc", key=key))
+                    new_emb.set_footer(text=t(lang, "footer_count", count=bot.store.count(key)))
+                    await m.edit(embed=new_emb, view=SignupView(key, bot.store))
+                    updated += 1
+        except Exception:
+            continue
+    await interaction.followup.send(f"Updated {updated} panels for `{key}`.")
+
+
 @bot.tree.command(name="queue_list", description="Show queue from oldest to newest.")
 @admin_only()
 @app_commands.describe(key="Queue key (e.g., boss-a)")
@@ -387,21 +581,60 @@ async def queue_list(interaction: discord.Interaction, key: str):
     )
 
 
-@bot.tree.command(name="queue_kick", description="Remove a user from the queue.")
+@bot.tree.command(name="queue_remove", description="Remove one or multiple users from the queue.")
 @admin_only()
-@app_commands.describe(key="Queue key", user="Member to remove")
-async def queue_kick(interaction: discord.Interaction, key: str, user: discord.Member):
+@app_commands.describe(
+    key="Queue key",
+    users="Mentions or IDs separated by space/comma",
+)
+async def queue_remove(interaction: discord.Interaction, key: str, users: str):
     await ensure_store_ready(interaction)
     lang = bot.store.get_lang()
-    ok = await bot.store.remove(key, user.id)
-    if ok:
-        await interaction.response.send_message(
-            t(lang, "kick_ok", user=user.display_name, key=key), ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            t(lang, "kick_none", key=key), ephemeral=True
-        )
+
+    # Parse user IDs from mentions/IDs
+    ids: List[int] = []
+    for token in re.split(r"[\s,]+", users.strip()):
+        if not token:
+            continue
+        m = re.match(r"<@!?([0-9]+)>", token)
+        if m:
+            ids.append(int(m.group(1)))
+        elif token.isdigit():
+            ids.append(int(token))
+    ids = list(dict.fromkeys(ids))  # unique preserve order
+
+    removed, missing = [], []
+    for uid in ids:
+        ok = await bot.store.remove(key, uid)
+        if ok:
+            removed.append(uid)
+        else:
+            missing.append(uid)
+
+    # Update panels
+    try:
+        await update_all_panels_for_key(interaction.guild, key, bot.store)
+    except Exception:
+        pass
+
+    def name(uid: int):
+        m = interaction.guild.get_member(uid)
+        return m.display_name if m else f"<@{uid}>"
+
+    removed_names = ", ".join(name(u) for u in removed) if removed else "-"
+    missing_names = ", ".join(name(u) for u in missing) if missing else "-"
+    await interaction.response.send_message(
+        t(
+            lang,
+            "remove_multi_result",
+            key=key,
+            removed=len(removed),
+            missing=len(missing),
+            removed_list=removed_names,
+            missing_list=missing_names,
+        ),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="queue_reset", description="Reset a queue.")
@@ -414,6 +647,11 @@ async def queue_reset(interaction: discord.Interaction, key: str):
     await interaction.response.send_message(
         t(lang, "reset_ok", key=key), ephemeral=True
     )
+    # Update all panels with this key across channels
+    try:
+        await update_all_panels_for_key(interaction.guild, key, bot.store)
+    except Exception as e:
+        print("[RESET_UPDATE_ERROR]", e)
 
 
 @bot.tree.command(name="queue_list_n", description="Show the first N users in a queue.")
@@ -450,6 +688,106 @@ async def queue_list_n(interaction: discord.Interaction, key: str, count: int = 
             total=len(users),
             lines=text,
         ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="queue_remove_n", description="Remove first N users from a queue.")
+@admin_only()
+@app_commands.describe(key="Queue key", count="How many to remove from the front")
+async def queue_remove_n(interaction: discord.Interaction, key: str, count: int):
+    await ensure_store_ready(interaction)
+    lang = bot.store.get_lang()
+    count = max(1, min(int(count), 50))
+    removed_ids = await bot.store.pop_n(key, count)
+    try:
+        await update_all_panels_for_key(interaction.guild, key, bot.store)
+    except Exception:
+        pass
+    names = []
+    for uid in removed_ids:
+        m = interaction.guild.get_member(uid)
+        names.append(m.display_name if m else f"<@{uid}>")
+    removed_text = ", ".join(names) if names else "-"
+    await interaction.response.send_message(
+        t(lang, "remove_n_result", key=key, n=len(removed_ids), users=removed_text),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="queue_notify_boss_run", description="DM the first N users with Accept/Leave buttons.")
+@admin_only()
+@app_commands.describe(key="Queue key", count="How many users to DM", channel="Target channel to open when Accept")
+async def queue_notify_boss_run(interaction: discord.Interaction, key: str, count: int, channel: discord.TextChannel):
+    await ensure_store_ready(interaction)
+    lang = bot.store.get_lang()
+    # Defer early to avoid interaction timeout while sending DMs
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    users = bot.store.get_list(key)
+    if not users:
+        await interaction.followup.send(
+            t(lang, "list_empty", key=key), ephemeral=True
+        )
+        return
+    count = max(1, min(int(count), 25))
+    targets = users[:count]
+
+    sem = asyncio.Semaphore(5)
+
+    async def send_dm(uid: int):
+        member = interaction.guild.get_member(uid)
+        if not member:
+            return uid, False, "not_member"
+        try:
+            async with sem:
+                # Guess a panel title for this key by scanning; fallback to default
+                async def guess_title() -> str:
+                    look_desc = f"`{key}`"
+                    look_title = f": {key}"
+                    for ch in interaction.guild.text_channels:
+                        try:
+                            async for m in ch.history(limit=100, oldest_first=False):
+                                if m.author != interaction.guild.me or not m.embeds:
+                                    continue
+                                emb = m.embeds[0]
+                                desc = (emb.description or "")
+                                ttl = (emb.title or "")
+                                if (look_desc in desc) or (look_title in ttl):
+                                    return ttl or t(lang, "panel_title", key=key)
+                        except Exception:
+                            continue
+                    return t(lang, "panel_title", key=key)
+
+                title = await guess_title()
+                desc = t(lang, "notify_dm_boss_run", title=title)
+                emb = discord.Embed(title=title, description=desc)
+                emb.set_footer(text=f"gid:{interaction.guild.id} key:{key}")
+                url = f"https://discord.com/channels/{interaction.guild.id}/{channel.id}"
+                view = DMRunView(store=bot.store, url=url, timeout=None)
+                await member.send(embed=emb, view=view)
+            return uid, True, None
+        except discord.Forbidden:
+            return uid, False, "forbidden"
+        except discord.HTTPException as e:
+            return uid, False, f"http_{getattr(e, 'status', 'err')}"
+        except Exception:
+            return uid, False, "error"
+
+    results = await asyncio.gather(*(send_dm(uid) for uid in targets))
+    ok = [uid for uid, success, _ in results if success]
+    fail = [(uid, reason) for uid, success, reason in results if not success]
+
+    def name(uid: int):
+        m = interaction.guild.get_member(uid)
+        return m.display_name if m else f"<@{uid}>"
+
+    ok_text = ", ".join(name(u) for u in ok) if ok else "-"
+    fail_text = ", ".join(f"{name(u)}({r})" for u, r in fail) if fail else "-"
+    await interaction.followup.send(
+        t(lang, "notify_result", key=key, sent=len(ok), failed=len(fail), sent_list=ok_text, failed_list=fail_text),
         ephemeral=True,
     )
 
@@ -600,9 +938,31 @@ if __name__ == "__main__":
     if BOT_TOKEN.count(".") < 2:
         print("[WARN] BOT_TOKEN format looks unusual. Ensure it's the Bot Token from Developer Portal > Bot tab, not Client Secret or OAuth token.")
 
-    try:
+    def _run_once():
         bot.run(BOT_TOKEN)
-    except discord.LoginFailure:
-        raise SystemExit(
-            "Login failed: invalid BOT_TOKEN. Regenerate the Bot Token (Developer Portal > Bot > Reset Token) and update your .env."
-        )
+
+    supervise = os.getenv("SUPERVISE", "1") != "0"
+    if supervise:
+        import time
+        delay = 5
+        while True:
+            try:
+                print("[SUPERVISOR] Starting bot run loop")
+                _run_once()
+                print("[SUPERVISOR] Bot exited normally; restarting in 5s")
+                time.sleep(5)
+            except discord.LoginFailure:
+                raise SystemExit(
+                    "Login failed: invalid BOT_TOKEN. Regenerate the Bot Token (Developer Portal > Bot > Reset Token) and update your .env."
+                )
+            except Exception as e:
+                print(f"[SUPERVISOR] Bot crashed: {e}; restarting in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+    else:
+        try:
+            _run_once()
+        except discord.LoginFailure:
+            raise SystemExit(
+                "Login failed: invalid BOT_TOKEN. Regenerate the Bot Token (Developer Portal > Bot > Reset Token) and update your .env."
+            )

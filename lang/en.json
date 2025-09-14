@@ -23,5 +23,9 @@
   "lang_name_vi": "Vietnamese",
   "token_missing": "Please set BOT_TOKEN environment variable or provide a token file.",
   "token_file_missing": "Token file not found!",
-  "token_file_empty": "Token file is empty!"
+  "token_file_empty": "Token file is empty!",
+  "remove_multi_result": "Removed: {removed} ( {removed_list} ). Missing: {missing} ( {missing_list} ) in `{key}`.",
+  "remove_n_result": "Removed first {n} users from `{key}`: {users}",
+  "notify_result": "DM sent: {sent}, failed: {failed}.\nSent: {sent_list}\nFailed: {failed_list}",
+  "notify_dm_boss_run": "{title} now is available for another run, click button to check time and make an order now to keep your seat."
 }
